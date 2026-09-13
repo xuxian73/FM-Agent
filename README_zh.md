@@ -160,7 +160,7 @@ uv run python main.py <proj_dir> [--resume] [--all-bugs] [--domain-knowledge FIL
 | `proj_dir` | 待检测代码库的目录路径 |
 | `--resume` | 续跑上一次中断的运行，而非从头开始 |
 | `--incremental INTENT_FILE` | 以增量模式运行，参数值为描述本次修改目标的意图文件路径。 |
-| `--all-bugs` | 在发现不匹配后继续推理并报告每个候选 Bug。完整和增量模式会逐个验证；入口函数模式不执行 Bug Validation。 |
+| `--all-bugs` | 在发现不匹配后继续推理并报告每个候选 Bug。完整和增量模式会逐个验证。 |
 | `--domain-knowledge FILE [FILE ...]` | 将额外的 Markdown 领域知识文件复制到本次运行中，并提供给 setup、规约生成和 Bug 验证 Agent。别名：`--knowledge`；可重复传入。 |
 | `--bug-validator FILE` | 使用自定义 Markdown 提示词执行 Bug 验证，替代内置的 `md/bug_validator.md`。 |
 | `--isolate` | 针对项目的隔离 git worktree 快照运行，而非直接在项目目录上运行。 |
@@ -222,17 +222,16 @@ uv run python main.py <proj_dir> --submodule src/core src/runtime
 uv run python main.py <proj_dir> --incremental intent.md --submodule src/core src/runtime
 ```
 
-`--submodule` 路径必须是 `proj_dir` 内部目录。该参数可与 `--resume`、`--isolate` 和 `--incremental` 一起使用，但不能与 `--entry-func` 一起使用。
+`--submodule` 路径必须是 `proj_dir` 内部目录。该参数可与 `--resume`、`--isolate` 和 `--incremental` 一起使用。
 
-`--all-bugs` 可用于完整、增量或入口函数分析：
+`--all-bugs` 可用于完整或增量分析：
 
 ```bash
 uv run python main.py <proj_dir> --all-bugs
 uv run python main.py <proj_dir> --incremental intent.md --all-bugs
-uv run python main.py <proj_dir> --entry-func src::main --all-bugs
 ```
 
-该选项默认关闭。启用后，FM-Agent 会继续检查后续推理检查点，并为每个候选写出一个标准 mismatch 结果。完整和增量模式会分别验证每个候选；入口函数模式只报告候选及其数量，按设计不执行 Bug Validation。
+该选项默认关闭。启用后，FM-Agent 会继续检查后续推理检查点，并为每个候选写出一个标准 mismatch 结果。完整和增量模式会分别验证每个候选。
 
 若主结果为 `path/to/function.json`，all-bugs 候选会写在同一目录下，依次命名为 `path/to/function.bug-001.json`、`bug-002.json` 等。主结果通过 `bug_count` 和 `reasoning_complete` 记录候选数量及推理是否完整。续跑时，完整的主结果就是 reasoning 阶段的检查点，只补跑尚未产生终态结果的候选验证；若 reasoning 中途停止，则只清理并重跑该函数的中间候选和验证，不影响其他已完成函数。
 
@@ -244,7 +243,7 @@ uv run python main.py <proj_dir> --entry-func src::main --all-bugs
 uv run python main.py <proj_dir> --only-spec
 ```
 
-当静态解析无法看到关键调用关系时（例如间接 syscall 分发），可使用 `--extra-edge FILE`。补充边会同时作用于完整运行、入口函数范围运行和增量运行。JSON 格式如下：
+当静态解析无法看到关键调用关系时（例如间接 syscall 分发），可使用 `--extra-edge FILE`。补充边会同时作用于完整运行和增量运行。JSON 格式如下：
 
 ```json
 {
@@ -331,13 +330,13 @@ FM-Agent 会在代码库目录下创建 `fm_agent/` 目录，主要输出内容�
 
 #### 交互式报告索引（`fm_agent/report.html`）
 
-每次完整流水线运行结束后（包括仅生成规约的 `--only-spec` 模式），会自动生成一个自包含的 `report.html` 索引页，将 Bug 验证结果与逐函数逻辑验证结果汇总到同一页面。该页面完全由运行产物渲染而成——不调用 LLM、不联网、无额外依赖，且为字节级确定：相同的产物始终生成相同的页面。
+每次完整流水线运行结束后（包括仅生成规约的 `--only-spec` 模式），会自动生成一个自包含的 `report.html` 索引页，将 Bug 验证结果与逐函数逻辑验证结果汇总到同一页面。该页面完全由运行产物渲染而成——不调用 LLM、不联网、无额外依赖。
 
 每一行展示报告标题、状态徽章、源文件（可点击跳转到原始源码）、函数名与代码位置。页面支持：
 
-- **搜索**：按标题、源文件、函数名、代码位置搜索
-- **筛选**：按状态（`confirmed` / `not_confirmed` / `error` / `pending`，或 `MATCH` / `MISMATCH` / `ERROR` / `SKIPPED`）与源文件筛选
-- **排序**：按状态、源文件、函数名或代码位置排序
+- **搜索**：按标题、源文件、函数名搜索
+- **筛选**：按状态（`confirmed_bug` / `potential_bug`）与源文件筛选
+- **排序**：按状态、源文件或函数名排序
 - **展开/折叠**：单个报告与全部报告一键展开/折叠，以及重置按钮
 
 页面写入 `fm_agent/report.html`，用浏览器打开即可浏览。也可随时基于任意已有运行的产物重新生成：`uv run python report.py <项目目录>`（也可直接传入 `fm_agent/` 工作目录或归档的工作区目录）。增量模式（`--incremental`）不会自动生成该页面，需手动运行上述命令。

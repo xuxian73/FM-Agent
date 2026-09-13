@@ -211,7 +211,7 @@ uv run python main.py <proj_dir> [--resume] [--all-bugs] [--domain-knowledge FIL
 | `proj_dir`                  | Directory of codebase that you want to check correctness                                        |
 | `--resume`                  | Continue a previous, interrupted run instead of starting over                                   |
 | `--incremental INTENT_FILE` | Run in incremental mode. The value is the path to an intent file describing the goal of the modification. |
-| `--all-bugs`                | Continue reasoning after a mismatch and report every candidate. Full and incremental modes validate each candidate; entry mode does not run bug validation. |
+| `--all-bugs`                | Continue reasoning after a mismatch and report every candidate. Full and incremental modes validate each candidate. |
 | `--domain-knowledge FILE [FILE ...]` | Copy extra Markdown domain-knowledge files into the run and provide them to setup, spec generation, and bug validation agents. Alias: `--knowledge`; may be repeated. |
 | `--bug-validator FILE`       | Use a custom Markdown prompt for bug validation instead of the built-in `md/bug_validator.md`. |
 | `--isolate`                 | Run against an isolated git worktree snapshot of the project instead of the project directory itself. |
@@ -290,21 +290,18 @@ uv run python main.py <proj_dir> --submodule src/core src/runtime
 uv run python main.py <proj_dir> --incremental intent.md --submodule src/core src/runtime
 ```
 
-`--submodule` paths must point to directories inside `proj_dir`. The option can be combined with `--resume`, `--isolate`, and `--incremental`, but not with `--entry-func`.
+`--submodule` paths must point to directories inside `proj_dir`. The option can be combined with `--resume`, `--isolate`, and `--incremental`.
 
-Use `--all-bugs` with full, incremental, or entry-point analysis:
+Use `--all-bugs` with full or incremental analysis:
 
 ```bash
 uv run python main.py <proj_dir> --all-bugs
 uv run python main.py <proj_dir> --incremental intent.md --all-bugs
-uv run python main.py <proj_dir> --entry-func src::main --all-bugs
 ```
 
 The option is off by default. When enabled, FM-Agent continues through later
 reasoning checkpoints and writes one standard mismatch result per candidate.
-Full and incremental modes validate each candidate independently. Entry-point
-reasoning reports the candidates and their count but intentionally does not run
-bug validation.
+Full and incremental modes validate each candidate independently.
 
 For a result such as `path/to/function.json`, all-bugs candidates are written
 beside it as `path/to/function.bug-001.json`, `bug-002.json`, and so on. The
@@ -322,7 +319,7 @@ Use `--only-spec` to stop after generating behavioral specs, skipping the reason
 uv run python main.py <proj_dir> --only-spec
 ```
 
-Use `--extra-edge FILE` when the static parser cannot see an important call relationship, such as indirect syscall dispatch. Supplemental edges are applied to full, entry-point-scoped, and incremental runs. The JSON shape is:
+Use `--extra-edge FILE` when the static parser cannot see an important call relationship, such as indirect syscall dispatch. Supplemental edges are applied to full and incremental runs. The JSON shape is:
 
 ```json
 {
@@ -419,17 +416,17 @@ A single self-contained `report.html` is generated automatically at the end of
 every full pipeline run (spec-only mode included), aggregating both the bug
 validation results and the per-function logic verification results into one
 browseable page. It is rendered purely from the run artifacts — no LLM calls,
-no network, no extra dependencies — and is byte-deterministic: the same
-artifacts always produce the same page.
+no network, no extra dependencies.
 
 Each row shows the report title, a status badge, the source file (linked back
 to the original source), the function name, and a code location. The page
 supports:
 
 - **Search** across title, source file, function name, and code location
-- **Filter** by status (`confirmed` / `not_confirmed` / `error` / `pending`,
-  or `MATCH` / `MISMATCH` / `ERROR` / `SKIPPED`) and by source file
-- **Sort** by status, source file, function name, or code location
+- **Filter** by status (`confirmed_bug` / `potential_bug`)
+  and by source file
+  (collapsible path tree; checking a directory selects all files under it).
+- **Sort** by status, source file, or function name
 - **Expand / collapse** individual reports or all reports at once, plus a
   reset button
 

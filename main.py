@@ -1,5 +1,8 @@
 from src.call_graph_edges import load_call_edges
-from src.entry_reasoning_pipeline import run_entry_pipeline
+from plugins.entry_reasoning.plugin import (
+    _entry_func_source_rel,
+    _make_run_copy,
+)
 from src.file_utils import (
     collect_file_names,
     _has_source_code,
@@ -8,6 +11,7 @@ from src.file_utils import (
     _json_file_is_valid,
     _is_under_submodules,
     _ensure_resume_mode_compatible,
+    clear_test_file_exemptions,
 )
 from src.verification import _generate_all_bugs_validation_summary
 from src.extract import run_extraction, EXT_TO_LANG
@@ -21,7 +25,7 @@ from src.git import (
     _record_version,
 )
 from src.languages.codegraph import try_codegraph_init
-from src.plugin import run_plugin_hook
+from src.plugin import PLUGIN_OPTION_NAMES, get_unsupported_plugin_options, run_plugin_hook
 from src.pipeline_setup import (
     _run_setup_extract,
     _run_generate_phases,
@@ -38,6 +42,13 @@ from src.run_estimate import (
     write_history,
     write_preflight_estimate,
 )
+from src.specification import (
+    SOFTWARE_PROFILE,
+    SpecificationProfile,
+    SpecificationProfileSession,
+    bind_profile_session,
+)
+from config import settings
 import os
 import sys
 import argparse
@@ -47,6 +58,7 @@ import shutil
 import logging
 import contextlib
 import subprocess
+from pathlib import Path
 
 
 def _clean_previous_run(work_dir):
@@ -58,6 +70,7 @@ def _clean_previous_run(work_dir):
 def _print_preflight_summary(estimate, output_path):
     scope = estimate["scope"]
     prediction = estimate["estimate"]
+    uncounted_files = scope.get("function_count_uncounted_files") or []
     included = ", ".join(scope["included_directories"]) or "(none)"
     excluded = ", ".join(
         item["path"] for item in scope["excluded_directories"][:8]
@@ -67,11 +80,17 @@ def _print_preflight_summary(estimate, output_path):
     print("[Estimate] ESTIMATE — no LLM calls were made.")
     print(f"[Estimate] Included directories: {included}")
     print(f"[Estimate] Excluded directories: {excluded}")
+    function_summary = f"~{scope['function_count']} function(s)"
+    if uncounted_files:
+        function_summary = (
+            f"~{scope['function_count']} locally counted function(s), "
+            f"{len(uncounted_files)} source file(s) require semantic extraction"
+        )
     print(
         "[Estimate] "
         f"{scope['included_file_count']} included source file(s), "
         f"{scope['excluded_file_count']} excluded source file(s), "
-        f"~{scope['function_count']} function(s)."
+        f"{function_summary}."
     )
     print(
         "[Estimate] Historical samples: "
@@ -100,6 +119,34 @@ def _format_estimate_duration(seconds):
     if minutes:
         return f"{minutes}m {seconds:02d}s"
     return f"{seconds}s"
+
+
+def _existing_required_source_files(proj_dir, required_source_files):
+    """Keep required files that still exist after a Stage 1 scope hook."""
+    if required_source_files is None:
+        return None
+    return [
+        source_file
+        for source_file in required_source_files
+        if os.path.isfile(os.path.join(proj_dir, source_file))
+    ]
+
+
+def _finalize_failed_entry_run(original_proj_dir, entry_run_dir):
+    """Preserve partial entry results after failure and remove the run copy."""
+    if not entry_run_dir or not os.path.isdir(entry_run_dir):
+        return
+
+    run_work_dir = os.path.join(entry_run_dir, "fm_agent")
+    ready_marker = os.path.join(run_work_dir, ".entry_scope_ready")
+    original_work_dir = os.path.join(original_proj_dir, "fm_agent")
+    if os.path.isfile(ready_marker) and os.path.isdir(run_work_dir):
+        os.remove(ready_marker)
+        if os.path.isdir(original_work_dir):
+            shutil.rmtree(original_work_dir)
+        shutil.copytree(run_work_dir, original_work_dir, symlinks=True)
+        print(f"[EntryPlugin] Copied partial fm_agent/ to {original_work_dir}.")
+    shutil.rmtree(entry_run_dir, ignore_errors=True)
 
 
 def _resolve_bug_validator_path(raw_path):
@@ -185,6 +232,34 @@ def _normalize_submodules(proj_dir, submodules):
     return collapsed
 
 
+def _active_plugin_options(args, effective_resume):
+    """Return active plugin-sensitive options."""
+    active = {
+        name
+        for name in PLUGIN_OPTION_NAMES
+        if getattr(args, name, False)
+    }
+    if effective_resume:
+        active.add("resume")
+    if settings.runtime.domain_knowledge_paths.strip() or os.environ.get("FM_AGENT_DOMAIN_KNOWLEDGE"):
+        active.add("domain_knowledge")
+    return active
+
+
+def _validate_plugin_options(parser, plugin_config, args, resume):
+    """Fail before side effects when a plugin denies an active option."""
+    unsupported = get_unsupported_plugin_options(
+        plugin_config,
+        _active_plugin_options(args, resume),
+    )
+    if unsupported:
+        flags = ", ".join(f"--{name.replace('_', '-')}" for name in unsupported)
+        parser.error(
+            f"Plugin '{plugin_config.name}' does not support option(s): {flags}. "
+            "Remove the option(s) or use a compatible plugin."
+        )
+
+
 def run_pipeline(
     proj_dir,
     resume=False,
@@ -195,10 +270,12 @@ def run_pipeline(
     extra_call_edges_path=None,
     only_spec=False,
     bug_validator_path=None,
+    validate_bugs=True,
     plugin_config=None,
     initial_history=None,
     plugin_context=None,
     all_bugs=False,
+    specification: SpecificationProfile | None = None,
 ):
     if not os.path.isdir(proj_dir):
         print(f"[Pipeline] ERROR: proj_dir does not exist or is not a directory: {proj_dir}")
@@ -214,6 +291,11 @@ def run_pipeline(
     output_dir = os.path.join(work_dir, "logic_verification_results")
     script_dir = os.path.dirname(os.path.abspath(__file__))
     extra_call_edges = load_call_edges(extra_call_edges_path)
+    profile_session = SpecificationProfileSession(
+        default_profile=specification or SOFTWARE_PROFILE,
+        plugin_root=(plugin_config.root if plugin_config is not None else None),
+        default_prompt_root=Path(script_dir),
+    )
 
     # Clean files from the previous run — unless resuming, where we keep all
     # prior progress (phases.json, generated specs, verification results) and
@@ -229,8 +311,6 @@ def run_pipeline(
         if initial_history is None:
             preserved_history = preserve_history_before_clean(work_dir)
         _clean_previous_run(work_dir)
-    if resume and not only_spec:
-        _ensure_resume_mode_compatible(output_dir, all_bugs)
     os.makedirs(work_dir, exist_ok=True)
     if preserved_history:
         write_history(work_dir, preserved_history)
@@ -243,16 +323,23 @@ def run_pipeline(
     _print_preflight_summary(estimate, estimate_path)
     if plugin_config is not None:
         plugin_context_path = os.path.join(work_dir, "plugin_context.json")
+        effective_plugin_context = dict(plugin_context or {})
+        if submodules:
+            effective_plugin_context["submodules"] = list(submodules)
         with open(plugin_context_path, "w", encoding="utf-8") as file:
-            json.dump(plugin_context or {}, file, indent=2)
+            json.dump(effective_plugin_context, file, indent=2)
         if plugin_config.configure_hook is not None:
-            run_plugin_hook(
-                plugin_config.name,
-                "configure",
-                plugin_config.configure_function,
-                plugin_config.configure_hook,
-                proj_dir,
-            )
+            with bind_profile_session(profile_session):
+                run_plugin_hook(
+                    plugin_config.name,
+                    "configure",
+                    plugin_config.configure_function,
+                    plugin_config.configure_hook,
+                    proj_dir,
+                )
+    specification = profile_session.freeze_and_validate()
+    if resume and not only_spec and specification.enable_reasoning:
+        _ensure_resume_mode_compatible(output_dir, all_bugs)
     domain_knowledge_relpaths = stage_domain_knowledge_files(
         proj_dir, work_dir, domain_knowledge_files
     )
@@ -296,6 +383,8 @@ def run_pipeline(
         _run_generate_phases(
             proj_dir, work_dir, script_dir, resume=resume,
             submodules=submodules,
+            workflow_source=specification.prompts.phase_plan,
+            specification=specification,
         )
         if phase_stage is not None and phase_stage.output_hook is not None:
             run_plugin_hook(
@@ -306,11 +395,15 @@ def run_pipeline(
                 proj_dir,
             )
 
+    surviving_required_source_files = _existing_required_source_files(
+        proj_dir, required_source_files
+    )
     phases_modified = _post_process_phases(
         proj_dir, work_dir,
-        required_source_files=required_source_files,
+        required_source_files=surviving_required_source_files,
         submodules=submodules,
         one_phase=one_phase,
+        specification=specification,
     )
 
     print("[Pipeline] Stage 2/6: Generating domain context...")
@@ -341,6 +434,7 @@ def run_pipeline(
             work_dir,
             script_dir,
             resume=resume and not phases_modified,
+            workflow_source=specification.prompts.domain_context,
         )
         if context_stage is not None and context_stage.output_hook is not None:
             run_plugin_hook(
@@ -384,7 +478,7 @@ def run_pipeline(
                 extraction_stage.input_hook,
                 proj_dir,
             )
-        run_extraction(proj_dir, work_dir=work_dir, force=not resume, verbose=True)
+        run_extraction(proj_dir, work_dir=work_dir, force=not resume, verbose=True, specification=specification)
         if extraction_stage is not None and extraction_stage.output_hook is not None:
             run_plugin_hook(
                 plugin_config.name,
@@ -397,19 +491,10 @@ def run_pipeline(
     # Copy system_prompt.md to spec_prompts/system_prompt.md
     spec_prompts_dir = os.path.join(work_dir, "spec_prompts")
     os.makedirs(spec_prompts_dir, exist_ok=True)
-    shutil.copy2(
-        os.path.join(script_dir, "md", "system_prompt.md"),
-        os.path.join(spec_prompts_dir, "system_prompt.md"),
-    )
-    shutil.copy2(
-        os.path.join(script_dir, "src", "generate_batch_prompts.py"),
-        os.path.join(spec_prompts_dir, "generate_batch_prompts.py"),
-    )
-    # generate_batch_prompts.py imports is_file_ready from this module at runtime.
-    shutil.copy2(
-        os.path.join(script_dir, "src", "file_utils.py"),
-        os.path.join(spec_prompts_dir, "file_utils.py"),
-    )
+    system_prompt_source = Path(specification.prompts.system)
+    system_prompt_destination = Path(spec_prompts_dir) / "system_prompt.md"
+    if system_prompt_source.resolve() != system_prompt_destination.resolve():
+        shutil.copy2(system_prompt_source, system_prompt_destination)
 
     phases_path = os.path.join(work_dir, "phases.json")
     with open(phases_path, "r") as f:
@@ -443,10 +528,11 @@ def run_pipeline(
                 file_list_stage.input_hook,
                 proj_dir,
             )
-        file_list = collect_file_names(input_dir, file_list_path)
+        file_list = collect_file_names(input_dir, file_list_path, specification)
         if submodules:
             file_list = _write_file_names(
-                _get_all_phase_files(phases_data, input_dir), file_list_path
+                _get_all_phase_files(phases_data, input_dir, specification),
+                file_list_path,
             )
         if file_list_stage is not None and file_list_stage.output_hook is not None:
             run_plugin_hook(
@@ -487,7 +573,7 @@ def run_pipeline(
                 topdown_stage.input_hook,
                 proj_dir,
             )
-        generate_topdown_layers(work_dir, extra_call_edges=extra_call_edges)
+        generate_topdown_layers(work_dir, extra_call_edges=extra_call_edges, specification=specification)
         if topdown_stage is not None and topdown_stage.output_hook is not None:
             run_plugin_hook(
                 plugin_config.name,
@@ -498,7 +584,7 @@ def run_pipeline(
             )
 
     # --- Stage 6: Execute spec generation workflow (per phase, per layer) ---
-    if only_spec:
+    if only_spec or not specification.enable_reasoning:
         print("[Pipeline] Stage 6/6: Generating specs (reasoning & bug validation disabled)...")
     else:
         print("[Pipeline] Stage 6/6: Generating specs & verification...")
@@ -536,20 +622,14 @@ def run_pipeline(
             extra_call_edges=extra_call_edges,
             only_spec=only_spec,
             bug_validator_path=bug_validator_path,
+            validate_bugs=validate_bugs,
             all_bugs=all_bugs,
+            specification=specification,
         )
-        if spec_stage is not None and spec_stage.output_hook is not None:
-            run_plugin_hook(
-                plugin_config.name,
-                "generate_specs_and_verification",
-                spec_stage.output_function,
-                spec_stage.output_hook,
-                proj_dir,
-            )
 
-    # Print confirmed bug count (skipped in only-spec mode, which runs no
-    # reasoning or bug validation).
-    if not only_spec:
+    # Print confirmed bug count only when reasoning and bug validation are
+    # both enabled for the active profile and invocation.
+    if not only_spec and validate_bugs and specification.enable_reasoning:
         if all_bugs:
             # A resumed run may find every function and candidate validation
             # already complete, so no watcher runs to refresh the persistent
@@ -572,10 +652,19 @@ def run_pipeline(
     except Exception as exc:
         logging.warning("[Pipeline] report.html generation skipped: %s", exc)
 
-    if only_spec:
+    if only_spec or not specification.enable_reasoning:
         print("[Pipeline] Done (specs only; reasoning & bug validation skipped).")
     else:
         print("[Pipeline] Done.")
+
+    if spec_stage is not None and spec_stage.output_hook is not None:
+        run_plugin_hook(
+            plugin_config.name,
+            "generate_specs_and_verification",
+            spec_stage.output_function,
+            spec_stage.output_hook,
+            proj_dir,
+        )
 
 
 if __name__ == "__main__":
@@ -717,9 +806,12 @@ if __name__ == "__main__":
         sys.exit(0)
 
     selected_plugin = args.plugin
-
-    if selected_plugin and args.entry_func is not None:
-        parser.error("--plugin cannot be combined with --entry-func.")
+    if args.entry_func is not None:
+        if selected_plugin is not None:
+            parser.error("--plugin cannot be combined with --entry-func.")
+        selected_plugin = "entry_reasoning"
+    elif selected_plugin == "entry_reasoning":
+        parser.error("the entry_reasoning plugin requires --entry-func.")
 
     plugin_config = None
     if selected_plugin:
@@ -738,7 +830,10 @@ if __name__ == "__main__":
         parser.error("the following arguments are required: proj_dir")
 
     resume = args.resume or os.environ.get("FM_AGENT_RESUME") == "1"
+    if plugin_config is not None:
+        _validate_plugin_options(parser, plugin_config, args, resume)
     proj_dir = os.path.abspath(args.proj_dir)
+    is_entry = args.entry_func is not None
     extra_call_edges_path = args.extra_edge
     if extra_call_edges_path:
         extra_call_edges_path = os.path.abspath(extra_call_edges_path)
@@ -811,46 +906,47 @@ if __name__ == "__main__":
 
     start_time = time.time()
 
-    # Entry-point mode uses its dedicated copy-and-trim pipeline.
-    if args.entry_func is not None:
-        dashboard_process = _start_dashboard(proj_dir) if args.dashboard else None
-        try:
-            run_entry_pipeline(
-                proj_dir,
-                entry_func=args.entry_func,
-                end_funcs=args.end_func,
-                resume=resume,
-                domain_knowledge_files=domain_knowledge_files,
-                one_phase=args.one_phase,
-                extra_call_edges_path=extra_call_edges_path,
-                only_spec=args.only_spec,
-                bug_validator_path=bug_validator_path,
-                all_bugs=args.all_bugs,
-            )
-        finally:
-            _stop_dashboard(dashboard_process)
-        end_time = time.time()
-        logging.info(f"Total time: {end_time - start_time:.2f} seconds")
-        sys.exit(0)
+    original_proj_dir = proj_dir
+    entry_run_dir = None
+    required_source_files = None
+    validate_bugs = True
+    if is_entry:
+        entry_run_dir = original_proj_dir + ".fm-entry-run"
+        _make_run_copy(original_proj_dir, entry_run_dir)
+        required_source_files = list(dict.fromkeys(
+            _entry_func_source_rel(entry) for entry in args.entry_func
+        ))
+        validate_bugs = False
+        plugin_context.update({
+            "original_proj_dir": original_proj_dir,
+            "entry_run_dir": entry_run_dir,
+            "entry_funcs": args.entry_func,
+            "end_funcs": args.end_func or [],
+            "all_bugs": args.all_bugs,
+        })
 
     # Incremental mode diffs against the commit recorded by a previous run, and
     # --isolate snapshots the repo via a git worktree, so both require a git repo.
     # A non-git project can only run the full pipeline against the project directory
     # itself.
-    if not _is_git_repo(proj_dir):
+    if not is_entry and not _is_git_repo(proj_dir):
         parser.error(
             f"FM-Agent requires a git repository, but {proj_dir} is not."
         )
 
     # Resolve the intent path before snapshotting, since cwd-relative paths must
     # resolve against the real project, not the frozen worktree copy.
-    intent_path = os.path.abspath(args.incremental) if args.incremental else None
+    intent_path = (
+        os.path.abspath(args.incremental)
+        if not is_entry and args.incremental
+        else None
+    )
 
     # In incremental mode the commit to diff against is the most recent one recorded
     # in version.log (the last line, since each run appends its commit). Read it from
     # the real project before snapshotting.
     old_commit = None
-    if args.incremental:
+    if not is_entry and args.incremental:
         version_path = os.path.join(proj_dir, "fm_agent", "version.log")
         if os.path.exists(version_path):
             with open(version_path, "r") as f:
@@ -860,14 +956,16 @@ if __name__ == "__main__":
     # Capture the project's latest commit id before running. With --isolate the
     # pipeline runs against a throwaway worktree snapshot whose HEAD is a synthetic
     # snapshot commit, so the version to record must come from the real project.
-    new_commit = _get_head_commit(proj_dir)
+    new_commit = _get_head_commit(proj_dir) if not is_entry else None
 
     # With --isolate, the pipeline runs against the snapshot's fm_agent/. Resuming
     # needs the previous run's fm_agent/ (phases.json, specs, verification results)
     # to be present in the snapshot, so copy the excluded workspace in for resume
     # too — not just incremental mode.
     run_ctx = (
-        frozen_worktree(
+        contextlib.nullcontext(entry_run_dir)
+        if is_entry
+        else frozen_worktree(
             proj_dir, copy_excluded=bool(args.incremental) or resume
         )
         if args.isolate
@@ -883,7 +981,7 @@ if __name__ == "__main__":
         try:
             # Incremental mode requires a recorded commit to diff against; without a
             # version.log from a previous run, fall back to the full pipeline.
-            if args.incremental and old_commit:
+            if not is_entry and args.incremental and old_commit:
                 run_incremental_pipeline(
                     run_dir,
                     intent_path,
@@ -899,12 +997,14 @@ if __name__ == "__main__":
                 run_pipeline(
                     run_dir,
                     resume=resume,
+                    required_source_files=required_source_files,
                     domain_knowledge_files=domain_knowledge_files,
                     submodules=submodules,
                     one_phase=args.one_phase,
                     extra_call_edges_path=extra_call_edges_path,
                     only_spec=args.only_spec,
                     bug_validator_path=bug_validator_path,
+                    validate_bugs=validate_bugs,
                     plugin_config=plugin_config,
                     initial_history=isolated_history,
                     plugin_context=plugin_context,
@@ -914,11 +1014,12 @@ if __name__ == "__main__":
             # it recreates fm_agent/; with --isolate it lives in the snapshot and is
             # copied back to the real project below. Only recorded on success so a
             # partial run does not advance the version baseline.
-            _record_version(new_commit, os.path.join(run_dir, "fm_agent"))
-            record_completed_run(
-                os.path.join(run_dir, "fm_agent"),
-                duration_seconds=time.time() - start_time,
-            )
+            if not is_entry:
+                _record_version(new_commit, os.path.join(run_dir, "fm_agent"))
+                record_completed_run(
+                    os.path.join(run_dir, "fm_agent"),
+                    duration_seconds=time.time() - start_time,
+                )
         finally:
             _stop_dashboard(dashboard_process)
             # With --isolate the pipeline ran against a throwaway snapshot, so its
@@ -926,7 +1027,10 @@ if __name__ == "__main__":
             # project so they are not lost when the snapshot is discarded — this runs
             # even when the pipeline crashes or is interrupted mid-run, so partial
             # progress survives and can be resumed with --resume.
-            if args.isolate:
+            if is_entry:
+                _finalize_failed_entry_run(original_proj_dir, entry_run_dir)
+                clear_test_file_exemptions()
+            elif args.isolate:
                 src_fm = os.path.join(run_dir, "fm_agent")
                 dst_fm = os.path.join(proj_dir, "fm_agent")
                 if os.path.isdir(src_fm):
